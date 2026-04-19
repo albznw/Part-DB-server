@@ -46,6 +46,9 @@ use App\Entity\Parts\Part;
 use App\Entity\Parts\PartLot;
 use Doctrine\ORM\EntityManagerInterface;
 use InvalidArgumentException;
+use Symfony\Component\DependencyInjection\Attribute\Autowire;
+use Symfony\Contracts\HttpClient\Exception\ExceptionInterface as HttpClientExceptionInterface;
+use Symfony\Contracts\HttpClient\HttpClientInterface;
 
 /**
  * @see \App\Tests\Services\LabelSystem\Barcodes\BarcodeScanHelperTest
@@ -64,8 +67,15 @@ final class BarcodeScanHelper
         'location' => LabelSupportedElement::STORELOCATION,
     ];
 
-    public function __construct(private readonly EntityManagerInterface $entityManager)
-    {
+    /** Seconds to wait for a short URL host to answer before giving up on resolving the redirect. */
+    private const SHORT_URL_TIMEOUT = 3.0;
+
+    public function __construct(
+        private readonly EntityManagerInterface $entityManager,
+        private readonly HttpClientInterface $httpClient,
+        #[Autowire('%env(string:SHORT_URL_PREFIX)%')]
+        private readonly string $shortUrlPrefix = '',
+    ) {
     }
 
     /**
@@ -110,6 +120,11 @@ final class BarcodeScanHelper
         }
 
         //Null means auto and we try the different formats
+        $result = $this->parseShortUrlBarcode($input);
+        if ($result !== null) {
+            return $result;
+        }
+
         $result = $this->parseInternalBarcode($input);
 
         if ($result !== null) {
@@ -208,6 +223,42 @@ final class BarcodeScanHelper
             target_id: $part->getID(),
             source_type: BarcodeSourceType::IPN
         );
+    }
+
+    private function parseShortUrlBarcode(string $input): ?BarcodeScanResultInterface
+    {
+        if ($this->shortUrlPrefix === '' || !str_starts_with($input, $this->shortUrlPrefix)) {
+            return null;
+        }
+
+        $path = ltrim(parse_url($input, PHP_URL_PATH) ?? '', '/');
+        if ($path === '') {
+            return null;
+        }
+
+        // IPN lookup takes priority
+        $ipnResult = $this->parseIPNBarcode($path);
+        if ($ipnResult !== null) {
+            return $ipnResult;
+        }
+
+        // Follow the redirect and parse the resolved URL. A short URL host that is down, slow or
+        // unresolvable must not break scanning, so treat any transport failure as "not a short URL".
+        try {
+            $response = $this->httpClient->request('GET', $input, [
+                'max_redirects' => 0,
+                'timeout' => self::SHORT_URL_TIMEOUT,
+            ]);
+            $location = $response->getHeaders(false)['location'][0] ?? null;
+        } catch (HttpClientExceptionInterface) {
+            return null;
+        }
+
+        if ($location === null) {
+            return null;
+        }
+
+        return $this->parseInternalBarcode($location);
     }
 
     /**
