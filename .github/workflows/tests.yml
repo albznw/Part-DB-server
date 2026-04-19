@@ -7,7 +7,7 @@ on:
   push:
     branches:
       - '*'
-      - "!l10n_*" # Dont test localization branches
+      - "!l10n_*"
   pull_request:
     branches:
       - '*'
@@ -125,15 +125,8 @@ jobs:
       - name: Load fixtures
         run: php bin/console --env test partdb:fixtures:load -n
 
-      - name: Run PHPunit and generate coverage
-        run: ./bin/phpunit --coverage-clover=coverage.xml
-
-      - name: Upload coverage
-        uses: codecov/codecov-action@v6
-        with:
-          env_vars: PHP_VERSION,DB_TYPE
-          token: ${{ secrets.CODECOV_TOKEN }}
-          fail_ci_if_error: true
+      - name: Run PHPunit
+        run: ./bin/phpunit
 
       - name: Test app:clean-attachments
         run: php bin/console partdb:attachments:clean-unused -n
