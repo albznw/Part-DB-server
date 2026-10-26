@@ -73,8 +73,8 @@ final class BarcodeScanHelper
     public function __construct(
         private readonly EntityManagerInterface $entityManager,
         private readonly HttpClientInterface $httpClient,
-        #[Autowire('%env(string:SHORT_URL_PREFIX)%')]
-        private readonly string $shortUrlPrefix = '',
+        #[Autowire('%env(string:SHORT_URL_DOMAIN)%')]
+        private readonly string $shortUrlDomain = '',
     ) {
     }
 
@@ -227,25 +227,55 @@ final class BarcodeScanHelper
 
     private function parseShortUrlBarcode(string $input): ?BarcodeScanResultInterface
     {
-        if ($this->shortUrlPrefix === '' || !str_starts_with($input, $this->shortUrlPrefix)) {
+        $input = trim($input);
+        $domain = strtolower(trim($this->shortUrlDomain));
+        if ($domain === '' || $input === '') {
             return null;
         }
 
-        $path = ltrim(parse_url($input, PHP_URL_PATH) ?? '', '/');
+        // QR codes may contain a full URL or only the domain and path. Keep the full URL for
+        // redirect resolution, adding HTTPS when the scheme was omitted.
+        $url = preg_match('~^https?://~i', $input) === 1 ? $input : 'https://' . $input;
+        $urlParts = parse_url($url);
+        if (!is_array($urlParts)) {
+            return null;
+        }
+
+        $scheme = strtolower($urlParts['scheme'] ?? '');
+        $host = strtolower($urlParts['host'] ?? '');
+
+        // Match the configured hostname exactly, not a lookalike such as s.albzn.com.attacker.test.
+        // The setting is a domain only, so custom ports and URL userinfo are not accepted.
+        if (!in_array($scheme, ['http', 'https'], true)
+            || $host !== $domain
+            || isset($urlParts['port'])
+            || isset($urlParts['user'])
+            || isset($urlParts['pass'])) {
+            return null;
+        }
+
+        // Strip any path prefixes (for example /i/, /s/, /b/ or /p/) and match only
+        // the final segment against the IPN. Query strings are not part of the short code.
+        $path = trim($urlParts['path'] ?? '', '/');
         if ($path === '') {
+            return null;
+        }
+        $pathSegments = explode('/', $path);
+        $shortCode = end($pathSegments);
+        if (!is_string($shortCode) || $shortCode === '') {
             return null;
         }
 
         // IPN lookup takes priority
-        $ipnResult = $this->parseIPNBarcode($path);
+        $ipnResult = $this->parseIPNBarcode($shortCode);
         if ($ipnResult !== null) {
             return $ipnResult;
         }
 
-        // Follow the redirect and parse the resolved URL. A short URL host that is down, slow or
-        // unresolvable must not break scanning, so treat any transport failure as "not a short URL".
+        // Resolve the full short URL without following redirects, then parse its Location header.
+        // A short URL host that is down, slow or unresolvable must not break scanning.
         try {
-            $response = $this->httpClient->request('GET', $input, [
+            $response = $this->httpClient->request('GET', $url, [
                 'max_redirects' => 0,
                 'timeout' => self::SHORT_URL_TIMEOUT,
             ]);
